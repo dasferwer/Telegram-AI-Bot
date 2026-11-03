@@ -1,0 +1,101 @@
+import asyncio
+from dataclasses import replace
+
+import pytest
+from aiohttp import ClientSession, web
+from aiohttp.test_utils import TestServer
+
+from telegram_ai.model import ModelClient, ModelError
+
+
+@pytest.mark.parametrize(
+    "status,kind,retryable",
+    [
+        (429, "quota", False),
+        (402, "quota", False),
+        (401, "configuration", False),
+        (404, "unavailable", False),
+        (503, "unavailable", True),
+    ],
+)
+async def test_http_errors_are_safe_and_have_bounded_retry_policy(
+    settings, status, kind, retryable
+):
+    async def respond(request):
+        return web.json_response({"error": {"message": "secret provider text"}}, status=status)
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        with pytest.raises(ModelError) as failure:
+            await client.complete([{"role": "user", "content": "тест"}])
+        assert failure.value.kind == kind
+        assert failure.value.retryable is retryable
+        assert "secret" not in str(failure.value)
+
+
+async def test_timeout_is_reported_without_unbounded_inline_retry(settings):
+    calls = 0
+
+    async def slow(request):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.1)
+        return web.json_response({})
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", slow)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(
+            session,
+            replace(
+                settings,
+                llm_api_base=str(server.make_url("")),
+                model_timeout=0.01,
+            ),
+        )
+        with pytest.raises(ModelError, match="время"):
+            await client.complete([])
+        assert calls == 1
+
+
+async def test_request_enforces_zero_price_no_model_fallback_and_output_limit(settings):
+    async def respond(request):
+        body = await request.json()
+        assert body["provider"]["max_price"] == {"prompt": 0, "completion": 0}
+        assert body["provider"]["allow_fallbacks"] is False
+        assert body["reasoning"] == {"enabled": False}
+        assert "models" not in body
+        assert body["max_tokens"] == settings.max_output_tokens
+        return web.json_response({"choices": [{"message": {"content": "x" * 20000}}]})
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        assert len(await client.complete([])) <= settings.max_output_chars
+
+
+@pytest.mark.parametrize(
+    "pricing,allowed",
+    [
+        ({"prompt": "0", "completion": "0"}, True),
+        ({"prompt": "0", "completion": "0.001"}, False),
+        ({"prompt": "0", "completion": "0", "request": "0.01"}, False),
+        ({"prompt": "0"}, False),
+    ],
+)
+async def test_catalog_refuses_paid_and_unknown_prices(settings, pricing, allowed):
+    async def catalog(request):
+        return web.json_response({"data": [{"id": settings.llm_model, "pricing": pricing}]})
+
+    app = web.Application()
+    app.router.add_get("/models", catalog)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        if allowed:
+            await client.verify_free_model()
+        else:
+            with pytest.raises(RuntimeError):
+                await client.verify_free_model()

@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: telegram-ai-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install --require-hashes -r requirements.txt
+    startCommand: PYTHONPATH=src python -m telegram_ai
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.13
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_URL_UNPOOLED
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: LLM_FREE_ONLY
+        value: "true"
