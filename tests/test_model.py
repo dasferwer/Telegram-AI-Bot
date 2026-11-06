@@ -1,4 +1,5 @@
 import asyncio
+import json
 from dataclasses import replace
 
 import pytest
@@ -68,7 +69,26 @@ async def test_request_enforces_zero_price_no_model_fallback_and_output_limit(se
         assert body["reasoning"] == {"enabled": False}
         assert "models" not in body
         assert body["max_tokens"] == settings.max_output_tokens
-        return web.json_response({"choices": [{"message": {"content": "x" * 20000}}]})
+        return web.json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "answer_directly",
+                                        "arguments": json.dumps({"answer": "x" * 20000}),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
 
     app = web.Application()
     app.router.add_post("/chat/completions", respond)
@@ -99,3 +119,167 @@ async def test_catalog_refuses_paid_and_unknown_prices(settings, pricing, allowe
         else:
             with pytest.raises(RuntimeError):
                 await client.verify_free_model()
+
+
+async def test_fresh_question_searches_then_answers_with_real_source_links(settings, monkeypatch):
+    from telegram_ai.search import WebSearch
+
+    requests = []
+
+    async def search(self, query):
+        assert query == "Лига чемпионов 2026 таблица"
+        return [
+            {
+                "title": "UEFA",
+                "url": "https://www.uefa.com/",
+                "snippet": "Published table",
+                "text": "Verified page excerpt",
+            }
+        ]
+
+    monkeypatch.setattr(WebSearch, "search", search)
+
+    async def respond(request):
+        body = await request.json()
+        requests.append(body)
+        assert "plugins" not in body
+        assert body["provider"]["max_price"] == {"prompt": 0, "completion": 0}
+        if len(requests) == 1:
+            assert body["tool_choice"] == "required"
+            return web.json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search",
+                                            "arguments": '{"query":"Лига чемпионов 2026 таблица"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            )
+        assert "tools" not in body
+        assert body["messages"][-1]["role"] == "tool"
+        assert "Verified page excerpt" in body["messages"][-1]["content"]
+        return web.json_response({"choices": [{"message": {"content": "Ответ по источнику [1]."}}]})
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        answer = await client.complete([{"role": "user", "content": "Кто лидирует сейчас?"}])
+        assert len(requests) == 2
+        assert "https://www.uefa.com/" in answer
+
+
+async def test_search_failure_stops_without_inventing_an_answer(settings, monkeypatch):
+    from telegram_ai.search import WebSearch
+
+    calls = 0
+
+    async def search(self, query):
+        return []
+
+    monkeypatch.setattr(WebSearch, "search", search)
+
+    async def respond(request):
+        nonlocal calls
+        calls += 1
+        return web.json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": '{"query":"новости"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        with pytest.raises(ModelError, match="Свежие сведения не проверены"):
+            await client.complete([])
+        assert calls == 1
+
+
+async def test_plain_answer_cannot_bypass_required_search_decision(settings):
+    async def respond(request):
+        return web.json_response({"choices": [{"message": {"content": "Сейчас 2024 год"}}]})
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        with pytest.raises(ModelError):
+            await client.complete([])
+
+
+async def test_tool_markup_from_final_answer_is_not_sent_to_user(settings, monkeypatch):
+    from telegram_ai.search import WebSearch
+
+    calls = 0
+
+    async def search(self, query):
+        return [{"title": "Source", "url": "https://example.com/", "snippet": "fact", "text": ""}]
+
+    monkeypatch.setattr(WebSearch, "search", search)
+
+    async def respond(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return web.json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search",
+                                            "arguments": '{"query":"news"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+        body = await request.json()
+        assert body["tool_choice"] == "none"
+        return web.json_response(
+            {"choices": [{"message": {"content": "<tool_call>bad</tool_call>"}}]}
+        )
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        with pytest.raises(ModelError):
+            await client.complete([{"role": "system", "content": "current date"}])

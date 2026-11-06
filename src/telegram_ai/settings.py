@@ -15,7 +15,7 @@ class Settings:
     allowed_user_ids: frozenset[int] = frozenset()
     webhook_base_url: str = ""
     llm_api_base: str = "https://openrouter.ai/api/v1"
-    llm_model: str = "google/gemma-4-31b-it:free"
+    llm_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     llm_free_only: bool = True
     port: int = 10000
     workers: int = 2

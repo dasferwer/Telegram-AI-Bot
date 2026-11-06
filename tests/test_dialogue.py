@@ -21,3 +21,15 @@ def test_context_keeps_recent_complete_turns_within_character_budget():
 def test_oversized_question_is_rejected_instead_of_silently_truncated():
     with pytest.raises(ValueError):
         build_messages([], "x" * 31, max_turns=1, max_chars=30)
+
+
+def test_current_date_is_supplied_even_when_history_claims_2024():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    messages = build_messages(
+        [("Какой год?", "Сейчас 2024 год.")], "А сегодня?", max_turns=12, max_chars=1000
+    )
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+    assert today in messages[0]["content"]
+    assert "Europe/Moscow" in messages[0]["content"]
