@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -8,6 +9,67 @@ import aiohttp
 
 from .search import SEARCH_FAILED, WebSearch
 from .settings import Settings
+
+logger = logging.getLogger("telegram_ai")
+
+
+def decode_message(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8").strip()
+    if text.startswith("{"):
+        data = json.loads(text)
+        if "error" in data:
+            raise model_error(int(data["error"].get("code", 502)))
+        return data["choices"][0]["message"]
+
+    message: dict[str, Any] = {"role": "assistant", "content": ""}
+    calls: dict[int, dict[str, Any]] = {}
+    finished = False
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        payload = "\n".join(
+            line[5:].lstrip(" ") for line in block.splitlines() if line.startswith("data:")
+        )
+        if not payload:
+            continue
+        if payload == "[DONE]":
+            finished = True
+            break
+        data = json.loads(payload)
+        if "error" in data:
+            raise model_error(int(data["error"].get("code", 502)))
+        for choice in data.get("choices", []):
+            if choice.get("index", 0) != 0:
+                continue
+            finished = finished or bool(choice.get("finish_reason"))
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content is not None:
+                if not isinstance(content, str):
+                    raise ValueError("Invalid content delta")
+                message["content"] += content
+            for fragment in delta.get("tool_calls", []):
+                index = fragment["index"]
+                if type(index) is not int or not 0 <= index < 4:
+                    raise ValueError("Invalid tool index")
+                call = calls.setdefault(
+                    index,
+                    {
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if fragment.get("id"):
+                    call["id"] = fragment["id"]
+                for field in ("name", "arguments"):
+                    part = fragment.get("function", {}).get(field)
+                    if part is not None:
+                        if not isinstance(part, str):
+                            raise ValueError("Invalid function delta")
+                        call["function"][field] += part
+    if not finished:
+        raise ValueError("Incomplete model stream")
+    if calls:
+        message["tool_calls"] = [calls[i] for i in sorted(calls)]
+    return message
 
 
 @dataclass
@@ -94,7 +156,8 @@ class ModelClient:
             raise ModelError(
                 "network", "Не удалось связаться с моделью. Попробуйте позже.", retryable=True
             ) from None
-        except (ValueError, KeyError, IndexError, TypeError, UnicodeError, AttributeError):
+        except (ValueError, KeyError, IndexError, TypeError, UnicodeError, AttributeError) as exc:
+            logger.info("model_invalid_response error=%s", type(exc).__name__)
             raise ModelError(
                 "invalid_response", "Модель вернула некорректный ответ. Попробуйте позже."
             ) from None
@@ -247,7 +310,12 @@ class ModelClient:
                 raw.extend(chunk)
                 if len(raw) > 512000:
                     raise ModelError("invalid_response", "Модель вернула слишком большой ответ.")
-            data = json.loads(raw)
-            if "error" in data:
-                raise model_error(int(data["error"].get("code", 502)), retry_after)
-            return data["choices"][0]["message"]
+            message = decode_message(bytes(raw))
+            logger.info(
+                "model_response content_type=%s bytes=%s tool_calls=%s has_content=%s",
+                response.content_type,
+                len(raw),
+                len(message.get("tool_calls") or []),
+                bool(message.get("content")),
+            )
+            return message

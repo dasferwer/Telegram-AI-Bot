@@ -283,3 +283,102 @@ async def test_tool_markup_from_final_answer_is_not_sent_to_user(settings, monke
         client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
         with pytest.raises(ModelError):
             await client.complete([{"role": "system", "content": "current date"}])
+
+
+async def test_streamed_tool_arguments_are_reassembled_when_provider_streams(settings):
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call1",
+                                "type": "function",
+                                "function": {"name": "answer_directly", "arguments": ""},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": '{"answer":"Сейчас '}}
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [{"index": 0, "function": {"arguments": '2026 год."}'}}]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    ]
+    data = (
+        ": OPENROUTER PROCESSING\n\n"
+        + "".join("data: " + json.dumps(e, ensure_ascii=False) + "\n\n" for e in events)
+        + "data: [DONE]\n\n"
+    )
+
+    async def respond(request):
+        assert (await request.json())["stream"] is False
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        raw = data.encode()
+        for i in range(0, len(raw), 7):
+            await response.write(raw[i : i + 7])
+        return response
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        c = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        assert await c.complete([]) == "Сейчас 2026 год."
+
+
+async def test_streamed_provider_error_is_safe(settings):
+    async def respond(request):
+        return web.Response(
+            text='data: {"error":{"code":503,"message":"secret"}}\n\n',
+            content_type="text/event-stream",
+        )
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        c = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        with pytest.raises(ModelError) as error:
+            await c.complete([])
+        assert error.value.kind == "unavailable"
+        assert "secret" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        b"data: {not json}\n\ndata: [DONE]\n\n",
+    ],
+)
+async def test_incomplete_or_malformed_stream_is_not_an_answer(settings, raw):
+    async def respond(request):
+        return web.Response(body=raw, content_type="text/event-stream")
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        c = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        with pytest.raises(ModelError) as failure:
+            await c.complete([])
+        assert failure.value.kind == "invalid_response"
