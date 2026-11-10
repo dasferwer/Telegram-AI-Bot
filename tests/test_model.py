@@ -382,3 +382,83 @@ async def test_incomplete_or_malformed_stream_is_not_an_answer(settings, raw):
         with pytest.raises(ModelError) as failure:
             await c.complete([])
         assert failure.value.kind == "invalid_response"
+
+
+async def test_multiple_direct_calls_return_all_distinct_answers(settings):
+    async def respond(request):
+        calls = [
+            {
+                "id": str(i),
+                "type": "function",
+                "function": {
+                    "name": "answer_directly",
+                    "arguments": json.dumps({"answer": answer}),
+                },
+            }
+            for i, answer in enumerate(
+                ["Сейчас 2026 год.", "Точная дата: 10 ноября 2026 года.", "Сейчас 2026 год."]
+            )
+        ]
+        return web.json_response({"choices": [{"message": {"tool_calls": calls}}]})
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        assert await client.complete([]) == "Сейчас 2026 год.\nТочная дата: 10 ноября 2026 года."
+
+
+async def test_search_takes_precedence_over_direct_call_in_same_response(settings, monkeypatch):
+    from telegram_ai.search import WebSearch
+
+    async def search(self, query):
+        return [
+            {"title": "Source", "url": "https://example.com/", "snippet": "Fresh fact", "text": ""}
+        ]
+
+    monkeypatch.setattr(WebSearch, "search", search)
+    requests = []
+
+    async def respond(request):
+        body = await request.json()
+        requests.append(body)
+        if len(requests) == 1:
+            return web.json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "a",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "answer_directly",
+                                            "arguments": '{"answer":"Unverified guess"}',
+                                        },
+                                    },
+                                    {
+                                        "id": "b",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search",
+                                            "arguments": '{"query":"latest facts"}',
+                                        },
+                                    },
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+        assert body["messages"][-1]["tool_call_id"] == "b"
+        return web.json_response({"choices": [{"message": {"content": "Проверенный факт [1]."}}]})
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", respond)
+    async with TestServer(app) as server, ClientSession() as session:
+        client = ModelClient(session, replace(settings, llm_api_base=str(server.make_url(""))))
+        answer = await client.complete([{"role": "system", "content": "current date"}])
+        assert "Unverified guess" not in answer
+        assert "Проверенный факт" in answer
+        assert "https://example.com/" in answer

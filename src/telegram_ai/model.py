@@ -193,18 +193,27 @@ class ModelClient:
             )
         message = await self._request(messages, tools)
         calls = message["tool_calls"]
-        if not isinstance(calls, list) or len(calls) != 1:
-            raise ValueError("Expected one decision")
-        call = calls[0]
+        if not isinstance(calls, list) or not 1 <= len(calls) <= 4:
+            raise ValueError("Expected bounded decisions")
+        answers: list[str] = []
+        search_call = None
+        for candidate in calls:
+            function = candidate["function"]
+            args = json.loads(function["arguments"])
+            if function["name"] == "answer_directly":
+                answers.append(self._limit(args["answer"]))
+            elif function["name"] == "web_search":
+                query = args["query"]
+                if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:
+                    raise ValueError("Invalid search query")
+                if search_call is None:
+                    search_call = (candidate, query)
+            else:
+                raise ValueError("Unknown tool")
+        if search_call is None:
+            return self._limit("\n".join(dict.fromkeys(answers)))
+        call, query = search_call
         function = call["function"]
-        args = json.loads(function["arguments"])
-        if function["name"] == "answer_directly":
-            return self._limit(args["answer"])
-        if function["name"] != "web_search":
-            raise ValueError("Unknown tool")
-        query = args["query"]
-        if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:
-            raise ValueError("Invalid search query")
         sources = await self.search.search(query)
         if not sources:
             raise ModelError("search", SEARCH_FAILED)
