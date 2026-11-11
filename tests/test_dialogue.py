@@ -33,3 +33,25 @@ def test_current_date_is_supplied_even_when_history_claims_2024():
     today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
     assert today in messages[0]["content"]
     assert "Europe/Moscow" in messages[0]["content"]
+
+
+@pytest.mark.parametrize(
+    "question", ["Какой сейчас год и точная дата?", "какой сейчас год", "Какая сегодня дата?"]
+)
+def test_current_date_uses_clock_without_model(question):
+    from datetime import date
+
+    from telegram_ai.dialogue import clock_answer
+
+    assert clock_answer(question, today=date(2026, 11, 10)) == (
+        "Сейчас 2026 год. Точная дата: 10 ноября 2026 года (по Москве)."
+    )
+
+
+@pytest.mark.parametrize(
+    "question", ["Какой год был перед 2020?", "Какая сегодня погода?", "Переведи: какой сейчас год"]
+)
+def test_other_date_mentions_are_not_replaced_by_clock(question):
+    from telegram_ai.dialogue import clock_answer
+
+    assert clock_answer(question) is None

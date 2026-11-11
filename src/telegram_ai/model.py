@@ -7,6 +7,7 @@ from typing import Any
 
 import aiohttp
 
+from .dialogue import clock_answer
 from .search import SEARCH_FAILED, WebSearch
 from .settings import Settings
 
@@ -144,6 +145,10 @@ class ModelClient:
 
     async def complete(self, messages: list[dict[str, str]]) -> str:
         try:
+            if messages and messages[-1].get("role") == "user":
+                answer = clock_answer(messages[-1]["content"])
+                if answer is not None:
+                    return self._limit(answer)
             async with asyncio.timeout(self.settings.model_timeout):
                 return await self._complete(messages)
         except TimeoutError:
@@ -163,58 +168,45 @@ class ModelClient:
             ) from None
 
     async def _complete(self, messages: list[dict[str, str]]) -> str:
-        tools = []
-        for name, field, description in (
-            (
-                "web_search",
-                "query",
-                "Найти свежие сведения: новости, результаты, цены, погоду, версии.",
-            ),
-            (
-                "answer_directly",
-                "answer",
-                "Готовый ответ для беседы, стабильных знаний и текущей даты.",
-            ),
-        ):
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {field: {"type": "string"}},
-                            "required": [field],
-                            "additionalProperties": False,
-                        },
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": (
+                        "Найти свежие сведения: новости, результаты, цены, погоду, версии."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": False,
                     },
-                }
-            )
+                },
+            }
+        ]
         message = await self._request(messages, tools)
-        calls = message["tool_calls"]
+        calls = message.get("tool_calls")
+        if calls is None or calls == []:
+            return self._answer(message)
         if not isinstance(calls, list) or not 1 <= len(calls) <= 4:
-            raise ValueError("Expected bounded decisions")
-        answers: list[str] = []
-        search_call = None
+            raise ValueError("Expected bounded tool calls")
+        queries: list[str] = []
+        ids: set[str] = set()
         for candidate in calls:
+            call_id = candidate["id"]
+            if not isinstance(call_id, str) or not call_id or call_id in ids:
+                raise ValueError("Invalid tool call ID")
+            ids.add(call_id)
             function = candidate["function"]
-            args = json.loads(function["arguments"])
-            if function["name"] == "answer_directly":
-                answers.append(self._limit(args["answer"]))
-            elif function["name"] == "web_search":
-                query = args["query"]
-                if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:
-                    raise ValueError("Invalid search query")
-                if search_call is None:
-                    search_call = (candidate, query)
-            else:
+            if candidate["type"] != "function" or function["name"] != "web_search":
                 raise ValueError("Unknown tool")
-        if search_call is None:
-            return self._limit("\n".join(dict.fromkeys(answers)))
-        call, query = search_call
-        function = call["function"]
-        sources = await self.search.search(query)
+            args = json.loads(function["arguments"])
+            query = args["query"]
+            if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:
+                raise ValueError("Invalid search query")
+            queries.append(query.strip())
+        sources = await self.search.search(queries[0])
         if not sources:
             raise ModelError("search", SEARCH_FAILED)
         evidence = {
@@ -231,20 +223,23 @@ class ModelClient:
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [
-                    {
-                        "id": call["id"],
-                        "type": "function",
-                        "function": function,
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": call["id"],
-                "content": json.dumps(evidence, ensure_ascii=False),
+                "tool_calls": calls,
             },
         ]
+        for i, call in enumerate(calls):
+            # Every declared call needs a matching tool result. Keep external work bounded.
+            result = (
+                evidence
+                if i == 0 or queries[i] == queries[0]
+                else {"error": "Дополнительный запрос не выполнен: разрешён один поиск на ответ."}
+            )
+            followup.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": json.dumps(result, ensure_ascii=False),
+                }
+            )
         followup[0] = {
             **followup[0],
             "content": followup[0]["content"]
@@ -254,18 +249,21 @@ class ModelClient:
                 "XML и вызовы функций. Если факты не найдены, прямо скажи об этом."
             ),
         }
-        answer = (await self._request(followup))["content"]
-        if isinstance(answer, str) and any(
-            marker in answer for marker in ("<tool_call", "<function=", "<parameter=")
-        ):
-            raise ValueError("Tool markup instead of answer")
-        self._limit(answer)  # Validate before appending links.
+        answer = self._answer(await self._request(followup, tools, tool_choice="none"))
         links = "\n\nИсточники:\n" + "\n".join(
             f"[{i}] {source['url']}" for i, source in enumerate(sources, 1)
         )
         if len(links) < self.settings.max_output_chars - 200:
             return self._limit(answer, self.settings.max_output_chars - len(links)) + links
         return self._limit(answer)
+
+    def _answer(self, message: dict[str, Any]) -> str:
+        if message.get("tool_calls"):
+            raise ValueError("Unexpected tool call instead of final answer")
+        answer = self._limit(message.get("content"))
+        if any(marker in answer for marker in ("<tool_call", "<function=", "<parameter=")):
+            raise ValueError("Tool markup instead of answer")
+        return answer
 
     def _limit(self, text: str, limit: int | None = None) -> str:
         if not isinstance(text, str) or not text.strip():
@@ -282,6 +280,8 @@ class ModelClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
+        *,
+        tool_choice: str = "auto",
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.settings.llm_model,
@@ -291,7 +291,7 @@ class ModelClient:
             "temperature": 0,
         }
         if tools:
-            body.update(tools=tools, tool_choice="required", parallel_tool_calls=False)
+            body.update(tools=tools, tool_choice=tool_choice, parallel_tool_calls=False)
         else:
             body["tool_choice"] = "none"
         if self.settings.llm_free_only:
@@ -321,10 +321,16 @@ class ModelClient:
                     raise ModelError("invalid_response", "Модель вернула слишком большой ответ.")
             message = decode_message(bytes(raw))
             logger.info(
-                "model_response content_type=%s bytes=%s tool_calls=%s has_content=%s",
+                "model_response content_type=%s bytes=%s tool_calls=%s "
+                "has_content=%s tool_markup=%s",
                 response.content_type,
                 len(raw),
                 len(message.get("tool_calls") or []),
                 bool(message.get("content")),
+                isinstance(message.get("content"), str)
+                and any(
+                    marker in message["content"]
+                    for marker in ("<tool_call", "<function=", "<parameter=")
+                ),
             )
             return message

@@ -3,10 +3,12 @@ import ipaddress
 import logging
 import socket
 from html.parser import HTMLParser
+from time import monotonic
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from ddgs import DDGS
+from ddgs.exceptions import DDGSException
 
 logger = logging.getLogger("telegram_ai")
 SEARCH_FAILED = (
@@ -85,9 +87,25 @@ class WebSearch:
         self.slots = asyncio.Semaphore(2)
 
     def _lookup(self, query: str) -> list[dict]:
-        return DDGS(timeout=6).text(
-            query, max_results=3, backend="duckduckgo,google", region="ru-ru"
-        )
+        for backend in ("duckduckgo,google", "yahoo,bing,brave"):
+            started = monotonic()
+            try:
+                results = DDGS(timeout=6).text(
+                    query, max_results=3, backend=backend, region="ru-ru"
+                )
+            except (DDGSException, TimeoutError, OSError) as exc:
+                logger.info(
+                    "search_backend_failed backend=%s error=%s no_results=%s elapsed_ms=%s",
+                    backend,
+                    type(exc).__name__,
+                    str(exc) == "No results found.",
+                    round((monotonic() - started) * 1000),
+                )
+                continue
+            if results:
+                logger.info("search_backend_ok backend=%s results=%s", backend, len(results))
+                return results
+        return []
 
     async def search(self, query: str) -> list[dict[str, str]]:
         if not isinstance(query, str) or not 1 <= len(query.strip()) <= 500:

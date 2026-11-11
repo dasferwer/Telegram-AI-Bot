@@ -110,3 +110,23 @@ def test_page_extraction_discards_scripts_and_navigation():
     parser = PageText()
     parser.feed("<nav>Menu</nav><script>bad()</script><p>Useful facts</p>")
     assert " ".join(parser.parts) == "Useful facts"
+
+
+def test_search_tries_reserve_engines_when_primary_are_unavailable(monkeypatch):
+    import telegram_ai.search as module
+
+    backends = []
+
+    class Engine:
+        def __init__(self, **kwargs):
+            pass
+
+        def text(self, query, **kwargs):
+            backends.append(kwargs["backend"])
+            if len(backends) == 1:
+                raise module.DDGSException("No results found.")
+            return [{"title": "Source", "href": "https://example.com/", "body": "Fresh result"}]
+
+    monkeypatch.setattr(module, "DDGS", Engine)
+    assert WebSearch()._lookup("latest facts")[0]["title"] == "Source"
+    assert backends == ["duckduckgo,google", "yahoo,bing,brave"]
