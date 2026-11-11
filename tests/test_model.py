@@ -66,7 +66,7 @@ async def test_request_enforces_zero_price_no_model_fallback_and_output_limit(se
         body = await request.json()
         assert body["provider"]["max_price"] == {"prompt": 0, "completion": 0}
         assert body["provider"]["allow_fallbacks"] is False
-        assert body["reasoning"] == {"enabled": False}
+        assert body["reasoning"] == {"max_tokens": 512, "exclude": True}
         assert "models" not in body
         assert body["max_tokens"] == settings.max_output_tokens
         assert body["tool_choice"] == "auto"

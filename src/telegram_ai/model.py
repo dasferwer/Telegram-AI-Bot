@@ -289,13 +289,16 @@ class ModelClient:
             "max_tokens": self.settings.max_output_tokens,
             "stream": False,
             "temperature": 0,
+            "reasoning": {
+                "max_tokens": max(1, min(512, self.settings.max_output_tokens // 2)),
+                "exclude": True,
+            },
         }
         if tools:
             body.update(tools=tools, tool_choice=tool_choice, parallel_tool_calls=False)
         else:
             body["tool_choice"] = "none"
         if self.settings.llm_free_only:
-            body["reasoning"] = {"enabled": False}
             body["provider"] = {
                 "max_price": {"prompt": 0, "completion": 0},
                 "allow_fallbacks": False,
